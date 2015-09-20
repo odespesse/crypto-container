@@ -1,0 +1,100 @@
+---
+- hosts: 127.0.0.1
+  connection: local
+  vars_prompt:
+    - name: session_password
+      prompt: What is the session password ?
+      private: yes
+    - name: container_password
+      prompt: What is the container password ?
+      private: yes
+  vars:
+    - container_owner: {{ ansible_env.USER }}
+    - container_path: /home/{{ container_owner }}/encdisk
+    - container_size_in_mb: 50
+    - container_key_path: /home/{{ container_owner }}/encdisk.key
+    - luks_container_name: safe
+    - mount_point_path: /media/{{ container_owner }}/encdisk
+  tasks:
+    - name: Check we don't overwrite an existing container
+      stat: path={{ container_path }}
+      register: is_container_already_present
+
+    - fail: msg="STOP ! A container already exists at {{ container_path }}"
+      when: is_container_already_present.stat.exists
+
+    - name: Install crypto packages
+      sudo: yes
+      apt: state=latest name="{{ item }}" update_cache=yes cache_valid_time=3600
+      with_items:
+        - dmsetup
+        - cryptsetup
+        - libpam-mount
+
+    - name: Create randomized container {{ container_path }}
+      command: dd if=/dev/urandom of={{ container_path }} bs=1M count={{ container_size_in_mb }}
+
+    - name: Define free loop device
+      command: losetup -f
+      register: free_loop_device
+
+    - name: Mount container on loop device
+      sudo: yes
+      command: losetup {{ free_loop_device.stdout }} {{ container_path }}
+
+    - name: Create container password temp file
+      command: mktemp /tmp/encdisk.XXXXXXX
+      register: tmp_container
+
+    - name: Create session password temp file
+      command: mktemp /tmp/encsess.XXXXXXX
+      register: tmp_session
+
+    - name: Write container password to temp file
+      shell: echo -n "{{ container_password }}" > {{ tmp_container.stdout }}
+
+    - name: Write session password to temp file
+      shell: echo -n "{{ session_password }}" > {{ tmp_session.stdout }}
+
+    - name: Create LUKS device
+      sudo: yes
+      shell: cat {{ tmp_container.stdout }} | cryptsetup luksFormat --batch-mode --hash sha256 --cipher aes-xts-plain64 --key-size 256 {{ free_loop_device.stdout }}
+
+    - name: Open LUKS device
+      sudo: yes
+      shell: cat {{ tmp_container.stdout }} | cryptsetup open --type luks {{ free_loop_device.stdout }} {{ luks_container_name }}
+
+    - name: Format loop device
+      sudo: yes
+      command: mke2fs -t ext4 /dev/mapper/{{ luks_container_name }}
+
+    - name: Close LUKS device
+      sudo: yes
+      command: cryptsetup close {{ luks_container_name }}
+
+    - name: Unmount loop device
+      sudo: yes
+      command: losetup -d {{ free_loop_device.stdout }}
+
+    - name: Encrypt password to key file
+      sudo: yes
+      shell: cat {{ tmp_container.stdout }} | openssl aes-256-cbc -pass file:{{ tmp_session.stdout }} -out {{ container_key_path }}
+
+    - name: Restrict rigths on the container's key file {{ container_key_path }}
+      sudo: yes
+      file: state=file path={{ container_key_path }} owner={{ container_owner }} group={{ container_owner }} mode=0400
+
+    - name: Purge container password temp file
+      command: shred -z -u {{ tmp_container.stdout }}
+
+    - name: Purge session password temp file
+      command: shred -z -u {{ tmp_session.stdout }}
+
+    - name: Create mountpoint {{ mount_point_path }}
+      sudo: yes
+      file: state=directory path={{ mount_point_path }} owner={{ container_owner }}
+
+    - name: Add container to PAM-mount
+      sudo: yes
+      lineinfile: dest=/etc/security/pam_mount.conf.xml line='<volume user="{{ container_owner }}" fstype="crypt" path="{{ container_path }}" options="loop,relatime" mountpoint="{{ mount_point_path }}" keysize="256" fskeypath="{{ container_key_path }}" fskeycipher="aes-256-cbc" fskeyhash="md5"/>' insertbefore='</pam_mount>'
+
